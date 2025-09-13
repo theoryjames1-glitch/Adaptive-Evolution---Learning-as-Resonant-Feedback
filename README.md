@@ -1908,3 +1908,430 @@ def test_ae_machine_copy_task_converges(device):
 
 If you want a **Neural Turing Machine–style shiftable pointer** (circular convolution + sharpening), I can add a `SoftPointer` class and a `make_shift_task` that trains AE to learn a fixed shift and recall.
 
+sweet — here’s a **shiftable pointer** add-on (NTM-style circular convolution + sharpening) and a tiny task that trains AE to learn a fixed pointer shift. It plugs into what you already have (`AE.py`, `AE_machine_runner.py`, `AE_tape.py`).
+
+---
+
+# `AE_pointer.py` — SoftPointer + shift task (new file)
+
+```python
+# -*- coding: utf-8 -*-
+"""
+AE_pointer.py — SoftPointer (NTM-style) + shift task for the AE Machine
+- Circular convolution over attention with a learnable shift distribution
+- Sharpening (beta >= 1) to keep attention concentrated
+- Task factory that teaches AE to realize a fixed pointer shift
+
+Depends on:
+    AE_tape.DifferentiableTape, AE_tape.TapeEnv
+    AE_machine_runner.AERunner, AE.AEConfig (for demos/tests)
+"""
+
+from __future__ import annotations
+from dataclasses import dataclass
+from typing import Optional, Callable, Tuple, List
+import math, torch
+from torch import Tensor
+import torch.nn.functional as F
+
+from AE_tape import DifferentiableTape, TapeEnv  # re-use your tape env
+
+# ---------------- SoftPointer ----------------
+
+@dataclass
+class SoftPointerCfg:
+    """Config for pointer sharpening; K must be odd (symmetric offsets)."""
+    K: int = 3                # number of shift bins (odd): e.g., 3 -> offsets [-1,0,+1]
+    eps: float = 1e-12
+
+class SoftPointer:
+    """
+    Location-based pointer shift:
+      a' = sharpen( circ_conv(a, softmax(shift_logits)) , beta )
+    where beta = 1 + softplus(beta_log)  (>= 1)
+    """
+    def __init__(self, N: int, cfg: SoftPointerCfg = SoftPointerCfg(), device: str | torch.device = "cpu",
+                 dtype: torch.dtype = torch.float64):
+        assert cfg.K % 2 == 1, "K must be odd (symmetric offsets)"
+        self.N = int(N)
+        self.cfg = cfg
+        self.device = torch.device(device)
+        self.dtype = dtype
+        # precompute integer offsets [-M..M]
+        self.M = (self.cfg.K - 1) // 2
+        self.offsets: List[int] = list(range(-self.M, self.M + 1))
+
+    def circ_conv(self, a: Tensor, p_shift: Tensor) -> Tensor:
+        """
+        Circularly convolve attention a (N) with p_shift (K).
+        Returns attention of shape (N) with wrap-around.
+        """
+        a = a.to(self.device, self.dtype)
+        p_shift = p_shift.to(self.device, self.dtype)
+        out = torch.zeros_like(a)
+        # For each relative offset o, roll a by +o and weight by p_shift[o]
+        for w, o in zip(p_shift, self.offsets):
+            out += w * torch.roll(a, shifts=o, dims=0)
+        # normalize to sum to 1 (numerical safety)
+        s = out.sum().clamp_min(self.cfg.eps)
+        return out / s
+
+    def sharpen(self, a: Tensor, beta_log: Tensor) -> Tensor:
+        """
+        Sharpen attention: a^beta / sum a^beta, beta = 1 + softplus(beta_log)
+        """
+        a = a.to(self.device, self.dtype)
+        beta_log = beta_log.to(self.device, self.dtype)
+        beta = 1.0 + torch.nn.functional.softplus(beta_log)
+        # prevent zeros to a^beta blow-ups
+        a_beta = (a.clamp_min(self.cfg.eps)) ** beta
+        return a_beta / a_beta.sum().clamp_min(self.cfg.eps)
+
+    def shift(self, a_base: Tensor, shift_logits: Tensor, beta_log: Tensor) -> Tensor:
+        """
+        Apply circular shift and sharpening to base attention.
+        shift_logits: logits over K offsets; softmax -> p_shift
+        beta_log: scalar controlling sharpening
+        """
+        p_shift = torch.softmax(shift_logits.to(self.device, self.dtype), dim=-1)
+        a_conv = self.circ_conv(a_base, p_shift)
+        return self.sharpen(a_conv, beta_log)
+
+# ---------------- Task: learn a fixed pointer shift ----------------
+
+def make_shift_task(
+    env: TapeEnv,
+    k_target: int,
+    reset_each_call: bool = True,
+    entropy_reg: float = 5e-4,
+    shift_prior: float = 1e-3,
+    beta_reg: float = 1e-6,
+) -> Callable[[Tensor], Tensor]:
+    """
+    Trainable θ packs:
+        [ write_vec (D) | write_logits (N) | shift_logits (K) | beta_log (1) ]
+    Steps:
+      1) (optional) reset tape
+      2) a_w = softmax(write_logits)
+      3) write write_vec at a_w
+      4) a_r = SoftPointer.shift(a_w, shift_logits, beta_log)
+      5) read r = a_r^T M
+      6) loss = 0.5 || r - write_vec ||^2
+            + entropy_reg * ( -H(a_w) - H(a_r) )
+            + shift_prior * CE(one_hot(k_target), softmax(shift_logits))
+            + beta_reg * beta_log^2
+    The CE term forces the learned shift to match k_target (relative offset).
+    """
+    D, N = env.tape.d, env.tape.n
+
+    # Choose smallest odd K that can represent k_target
+    K = max(3, 2 * abs(k_target) + 1)
+    ptr = SoftPointer(N=N, cfg=SoftPointerCfg(K=K), device=env.tape.device, dtype=env.tape.dtype)
+
+    # build a one-hot prior distribution over offsets centered at k_target
+    M = (K - 1) // 2
+    offsets = list(range(-M, M + 1))
+    target_idx = offsets.index(int(k_target))
+
+    def loss_fn(theta: Tensor) -> Tensor:
+        assert theta.numel() == D + N + K + 1, f"θ must have {D+N+K+1} elements (got {theta.numel()})"
+        write_vec   = theta[:D]
+        write_logit = theta[D:D+N]
+        shift_logit = theta[D+N:D+N+K]
+        beta_log    = theta[-1]
+
+        if reset_each_call:
+            env.reset()
+
+        # write
+        a_w = torch.softmax(write_logit, dim=-1)
+        env.tape.write(a_w, write_vec)
+
+        # read after shift
+        a_r = ptr.shift(a_w, shift_logit, beta_log)
+        r = env.tape.read(a_r)
+
+        # reconstruction (want r == write_vec)
+        mse = 0.5 * torch.sum((r - write_vec) ** 2)
+
+        # modest entropy penalty to avoid pathological diffusion
+        eps = 1e-12
+        H_w = -torch.sum(a_w * torch.log(a_w + eps))
+        H_r = -torch.sum(a_r * torch.log(a_r + eps))
+        ent = entropy_reg * (-H_w - H_r)
+
+        # shift prior
+        p_shift = torch.softmax(shift_logit, dim=-1)
+        ce = -torch.log(p_shift[target_idx].clamp_min(1e-12))
+        ce = shift_prior * ce
+
+        # small reg on beta_log
+        breg = beta_reg * (beta_log * beta_log)
+
+        return mse + ent + ce + breg
+
+    # stash task meta in closure for tests/demos
+    loss_fn._meta = {"K": K, "offsets": offsets, "target_idx": target_idx}  # type: ignore[attr-defined]
+    return loss_fn
+
+# ---------------- Demo ----------------
+
+if __name__ == "__main__":
+    from AE import AEConfig
+    from AE_machine_runner import AERunner, AERunnerConfig
+
+    device, dtype = "cpu", torch.float64
+    tape = DifferentiableTape(n_cells=8, cell_dim=3, device=device, dtype=dtype)
+    env  = TapeEnv(tape)
+    k_target = +2
+
+    loss_fn = make_shift_task(env, k_target=k_target, reset_each_call=True)
+
+    dim_theta = tape.d + tape.n + loss_fn._meta["K"] + 1  # type: ignore[index]
+    cfg = AEConfig(
+        device=device, dtype=dtype,
+        sigma_min=0.0, sigma_max=0.0,
+        auto_gamma=True, auto_gamma_warmup=20,
+        alpha_min=1e-6, alpha_max=0.2
+    )
+    runner = AERunner(
+        dim=dim_theta, loss_fn=loss_fn, ae_cfg=cfg,
+        seed=0, init_alpha=0.05, init_mu=0.0,
+        device=device, dtype=dtype,
+        runner_cfg=AERunnerConfig(eps_loss=1e-3, gamma_min=5e-5, v_max_accept=5e-3, print_every=50),
+    )
+
+    print(" step |       L |         T |         V |  rho |     alpha |   mu  |     gamma |   gnorm")
+    print("----- +---------+-----------+-----------+------+-----------+-------+-----------+--------")
+    final = runner.run(max_steps=600)
+    print("final:", final)
+```
+
+---
+
+# `test_ae_pointer.py` — quick tests (new)
+
+```python
+# test_ae_pointer.py
+from __future__ import annotations
+import torch, pytest
+from AE_tape import DifferentiableTape, TapeEnv
+from AE_pointer import SoftPointer, SoftPointerCfg, make_shift_task
+from AE_machine_runner import AERunner, AERunnerConfig
+from AE import AEConfig
+
+@pytest.fixture(autouse=True)
+def _seed_all():
+    torch.manual_seed(1234)
+
+@pytest.fixture
+def device(): return "cpu"
+
+def test_softpointer_circular_shift(device):
+    N, K = 8, 3
+    ptr = SoftPointer(N, SoftPointerCfg(K=K), device=device, dtype=torch.float64)
+    a = torch.zeros(N, dtype=torch.float64, device=device); a[0] = 1.0
+    # shift +1: logits favor the last bin (offsets [-1,0,+1] -> index 2)
+    shift_logits = torch.tensor([-5.0, -5.0, 5.0], dtype=torch.float64, device=device)
+    beta_log = torch.tensor(0.0, dtype=torch.float64, device=device)
+    a2 = ptr.shift(a, shift_logits, beta_log)
+    # should be (almost) one-hot at index 1
+    assert int(a2.argmax().item()) == 1
+
+def test_ae_shift_task_learns_target_shift(device):
+    device, dtype = "cpu", torch.float64
+    tape = DifferentiableTape(n_cells=8, cell_dim=3, device=device, dtype=dtype)
+    env  = TapeEnv(tape)
+    k_target = +2  # learn to shift pointer by +2
+    loss_fn = make_shift_task(env, k_target=k_target, reset_each_call=True,
+                              entropy_reg=5e-4, shift_prior=1e-3, beta_reg=1e-6)
+    dim_theta = tape.d + tape.n + loss_fn._meta["K"] + 1  # type: ignore[index]
+
+    cfg = AEConfig(
+        device=device, dtype=dtype,
+        sigma_min=0.0, sigma_max=0.0,         # deterministic
+        auto_gamma=True, auto_gamma_warmup=20,
+        alpha_min=1e-6, alpha_max=0.2,
+    )
+    runner = AERunner(
+        dim=dim_theta, loss_fn=loss_fn, ae_cfg=cfg, seed=7,
+        init_alpha=0.05, init_mu=0.0,
+        device=device, dtype=dtype,
+        runner_cfg=AERunnerConfig(eps_loss=1e-3, gamma_min=5e-5, v_max_accept=5e-3, print_every=0),
+    )
+
+    # initial loss
+    theta0 = runner.agent.theta.detach().clone().requires_grad_(True)
+    loss0 = float(loss_fn(theta0).item())
+
+    log = runner.run(max_steps=600)
+
+    # final loss
+    thetaT = runner.agent.theta.detach().clone().requires_grad_(True)
+    lossT = float(loss_fn(thetaT).item())
+
+    # Learned shift distribution peaks at target offset
+    K = loss_fn._meta["K"]            # type: ignore[index]
+    M = (K - 1) // 2
+    target_idx = loss_fn._meta["target_idx"]  # type: ignore[index]
+    # unpack shift logits from θ
+    D, N = tape.d, tape.n
+    shift_logits_T = thetaT[D+N:D+N+K]
+    p_shift_T = torch.softmax(shift_logits_T, dim=-1)
+    assert int(p_shift_T.argmax().item()) == int(target_idx)
+
+    # plus: loss reduction sanity
+    assert lossT <= 0.5 * loss0 + 1e-9
+```
+
+---
+
+## How to use
+
+1. Save both files:
+
+   * `AE_pointer.py`
+   * `test_ae_pointer.py`
+
+2. Run tests:
+
+```bash
+PYTHONPATH=. pytest -q test_ae_pointer.py
+```
+
+short answer: AE isn’t a Transformer (so it’s not “a GPT-2”), but it’s a **meta-controller** you can bolt onto GPT-2 to **tune, train, or “program”** it—both during fine-tuning and at inference.
+
+Here are three pragmatic ways:
+
+# 1) Fine-tune GPT-2 with an AE meta-controller (no extra VRAM)
+
+Treat GPT-2 as the “plant.” AE reads cheap signals (loss trend, grad norm/var) and **adapts optimizer knobs** (lr, β1, noise) on the fly. This keeps memory flat vs. vanilla because you only compute **scalar reductions**.
+
+```python
+# AE-driven GPT-2 fine-tuning (skeleton)
+import torch, torch.nn as nn
+from transformers import AutoModelForCausalLM, AutoTokenizer
+# --- tiny AE meta (signal → knobs), DSP-style ---
+class AEMeta:
+    def __init__(self):
+        self.mu_L=0.0; self.mu_d=0.0; self.mu_V=0.0; self.t=0
+        # gains/targets (tweakable)
+        self.kp=0.9; self.kv=0.9; self.kc=0.4
+        self.lr_bar=3e-4; self.beta1_bar=0.9
+        self.eta_a=8e-4; self.eta_b=8e-4
+        self.max_dlog_lr=0.1; self.max_d_beta=0.02
+        self.lr=3e-4; self.beta1=0.9; self.sigma=0.0
+    def _ema(self, m, x, b=0.95): return b*m + (1-b)*x
+    def update(self, loss, grad_norm):
+        self.t += 1
+        L = float(loss); g = float(grad_norm)
+        mu_L_prev = self.mu_L
+        self.mu_L = self._ema(self.mu_L, L, 0.98)
+        dL = L - mu_L_prev if self.t>1 else 0.0
+        self.mu_d = self._ema(self.mu_d, dL, 0.90)
+        ld = max(min(L - self.mu_L, 1e6), -1e6)
+        V = self._ema(self.mu_V, ld*ld, 0.95); self.mu_V = V
+        # drive: lower lr when variance ↑, raise when trend ↓ and alignment is good (proxy via small gamma)
+        gamma = self.lr * g
+        drive_lr =  self.kp * (-torch.tanh(torch.tensor(self.mu_d)).item()) \
+                  - self.kv * (V / (abs(self.mu_V)+1e-12)) \
+                  - 0.05 * (torch.log(torch.tensor(self.lr+1e-12)).item() - torch.log(torch.tensor(self.lr_bar)).item())
+        dlog_lr = max(min(self.eta_a * drive_lr, self.max_dlog_lr), -self.max_dlog_lr)
+        self.lr = float(torch.exp(torch.log(torch.tensor(self.lr)) + dlog_lr))
+        self.lr = float(max(min(self.lr, 2e-3), 1e-6))
+        # beta1 nudges
+        drive_b = -0.6 * (V / (abs(self.mu_V)+1e-12)) - 0.05 * (self.beta1 - self.beta1_bar)
+        d_beta = max(min(self.eta_b * drive_b, self.max_d_beta), -self.max_d_beta)
+        self.beta1 = float(min(max(self.beta1 + d_beta, 0.5), 0.999))
+        # optional exploration (usually 0 for LM)
+        self.sigma = 0.0
+        return {"lr": self.lr, "beta1": self.beta1, "sigma": self.sigma, "gamma": gamma, "V": V}
+
+def add_grad_noise(params, std):
+    if std<=0: return
+    with torch.no_grad():
+        for p in params:
+            if p.grad is not None:
+                p.grad.add_(torch.randn_like(p.grad)*std)
+
+# --- hook into vanilla loop (no extra activations) ---
+tok = AutoTokenizer.from_pretrained("gpt2")
+model = AutoModelForCausalLM.from_pretrained("gpt2")
+model.train()
+opt = torch.optim.AdamW(model.parameters(), lr=3e-4, betas=(0.9,0.999), weight_decay=0.1)
+ae = AEMeta()
+
+for step, batch in enumerate(dataloader):  # supply your dataloader
+    out = model(**batch)                   # batch already tokenized, labels in batch
+    loss = out.loss
+    opt.zero_grad(set_to_none=True)
+    loss.backward()
+    grad_norm = torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0).item()
+    knobs = ae.update(loss.item(), grad_norm)
+
+    # apply AE knobs to optimizer (keeps VRAM same as vanilla)
+    for g in opt.param_groups:
+        b1, b2 = g["betas"]
+        g["lr"] = knobs["lr"]
+        g["betas"] = (knobs["beta1"], b2)
+    add_grad_noise(model.parameters(), knobs["sigma"])
+
+    opt.step()
+```
+
+Tips:
+
+* You can split param groups (e.g., **one AE controller per Transformer block**) to get layerwise lr/β1 without memory spikes.
+* For **PEFT** (LoRA/adapters/prefix), freeze the base model and let AE drive the lr/β1 for just the small adapter params.
+
+# 2) “Program” GPT-2 via soft prompts (AE tunes the program)
+
+AE can treat a **soft prompt** (learnable embeddings prepended to input) as the parameters to optimize. That “programs” GPT-2 behavior without touching the backbone.
+
+Sketch:
+
+* Create `prompt = nn.Parameter(torch.randn(n_virtual, hidden))`
+* At each batch: splice prompt into the input embedding stream (or use a wrapper module)
+* Loss = LM cross-entropy on your task
+* Use the **same AEMeta** above to adapt lr/β1 while optimizing only `prompt`
+* Result: targeted behaviors with minimal VRAM (& often surprisingly strong control)
+
+# 3) Inference-time controller (temperature/top-p)
+
+AE can also **steer generation** without gradient steps:
+
+* Signals: token-level negative log-likelihood, output entropy, repetition rate.
+* Knobs: temperature τ, top-p, top-k (and even penalty weights).
+* Law: nudge τ up if entropy is too low (over-confident/repetitive), down if too high (rambling).
+
+Tiny example:
+
+```python
+class AESampler:
+    def __init__(self, H_target=3.5):
+        self.Ht=H_target; self.tau=1.0
+    def update(self, probs):  # probs: softmax logits of next token
+        H = float(-(probs * (probs.clamp_min(1e-12)).log()).sum().item())
+        d = self.Ht - H
+        self.tau = float(max(min(self.tau * (1.0 + 0.05*d), 2.0), 0.5))
+        return {"temperature": self.tau}
+
+# use: before sampling next token, scale logits /= tau from AESampler
+```
+
+---
+
+## What about “AE Machine = GPT-2”?
+
+* **Conceptually:** you *can* view GPT-2’s weights $\theta$ as the AE Machine’s state, and let AE’s laws update $(\alpha,\mu,\sigma)$ that steer $\theta$. That’s exactly (1) and (2).
+* **Architecturally:** AE is not a Transformer; it’s the **control law** on top of a model (GPT-2, adapters, or prompts). You can also meta-learn AE’s gains end-to-end later.
+
+## Recommended paths (lowest lift → most control)
+
+1. **PEFT + AE meta-lr:** Freeze GPT-2, train LoRA/prefix with AE-controlled lr/β1. Fast, safe, tiny VRAM.
+2. **Full FT with AE meta-lr:** Let AE drive group-wise lr/β1 over blocks. Good robustness to drift.
+3. **Inference steering:** Use AE to shape τ/top-p in real time from output entropy/reward.
+
+If you want, I can tailor a concrete script for your dataset (HF `datasets` + `transformers`) in either PEFT or full FT style, and map AE knobs per layer (e.g., 12 controllers for GPT-2 small).
+
+
