@@ -1495,3 +1495,178 @@ if __name__ == "__main__":
 
 If you want, I can wire this AE Machine to your existing `AE.py` agent (as a drop-in “controller core”) or sketch a memory-augmented variant with a tiny differentiable tape.
 
+awesome — I’ll wire an **AE Machine runner** *on top of your existing `AE.py`* (uses `AEAgent` internally), with a clean halt/accept predicate (loss/γ/V). I’ll also drop a tiny pytest to sanity-check it. No extra VRAM, no fancy deps.
+
+---
+
+# `AE_machine_runner.py` (drop-in)
+
+```python
+# -*- coding: utf-8 -*-
+"""
+AE_machine_runner.py — AE Machine runner on top of AE.AEAgent
+
+Purpose:
+- Provide a "machine-style" run loop with a clear accept/halt predicate:
+  * accept if loss <= eps_loss
+  * OR (gamma <= gamma_min AND V <= v_max_accept)
+- Minimal surface: you hand in a loss_fn(θ) and we drive AEAgent until accept or max_steps.
+
+Usage:
+    from AE import AEAgent, AEConfig
+    from AE_machine_runner import AERunner, AERunnerConfig
+
+    cfg = AEConfig(device="cpu", dtype=torch.float64, sigma_min=0.0, sigma_max=0.0)
+    runner = AERunner(
+        dim=2,
+        loss_fn=lambda theta: 0.5*((theta*theta).sum()),  # toy
+        ae_cfg=cfg,
+        init_alpha=5e-2, init_mu=0.0,
+        runner_cfg=AERunnerConfig(eps_loss=1e-6, print_every=50),
+    )
+    log = runner.run(max_steps=300)
+    print("final:", log)
+"""
+
+from __future__ import annotations
+from dataclasses import dataclass
+from typing import Callable, Optional, Dict, Union
+import math
+import torch
+from torch import Tensor
+
+from AE import AEAgent, AEConfig  # relies on your existing AE.py
+
+LossFn = Callable[[Tensor], Union[Tensor, tuple]]
+
+@dataclass
+class AERunnerConfig:
+    # Accept / halt thresholds
+    eps_loss: float = 1e-3         # accept if loss <= eps_loss
+    gamma_min: float = 1e-4        # or gamma <= gamma_min
+    v_max_accept: float = 1e-2     # with V <= v_max_accept
+    # Logging
+    print_every: int = 0           # 0 disables printing
+    # Safety (optionally override AE agent kwargs here)
+    clip_grad_norm: Optional[float] = None
+
+class AERunner:
+    """
+    AE Machine runner that delegates adaptation & updates to AEAgent.
+    It provides a physics-style "machine" loop and an accept predicate.
+    """
+    def __init__(
+        self,
+        dim: int,
+        loss_fn: LossFn,
+        ae_cfg: AEConfig,
+        seed: Optional[int] = None,
+        init_theta: Optional[Tensor] = None,
+        init_alpha: float = 3e-4,
+        init_mu: float = 0.9,
+        init_sigma: float = 0.0,
+        device: Optional[Union[str, torch.device]] = None,
+        dtype: Optional[torch.dtype] = None,
+        runner_cfg: Optional[AERunnerConfig] = None,
+    ):
+        self.loss_fn = loss_fn
+        self.rcfg = runner_cfg or AERunnerConfig()
+        self.device = torch.device(device or ae_cfg.device)
+        self.dtype = dtype or ae_cfg.dtype
+
+        self.agent = AEAgent(
+            dim=dim, cfg=ae_cfg, seed=seed,
+            init_theta=init_theta,
+            init_alpha=init_alpha, init_mu=init_mu, init_sigma=init_sigma,
+            device=self.device, dtype=self.dtype,
+            clip_grad_norm=self.rcfg.clip_grad_norm,
+        )
+
+    def accepted(self, log: Dict[str, float]) -> bool:
+        # AEAgent.step() returns at least: loss, V, gamma
+        return (log["loss"] <= self.rcfg.eps_loss) or \
+               ((log["gamma"] <= self.rcfg.gamma_min) and (log["V"] <= self.rcfg.v_max_accept))
+
+    def run(self, max_steps: int) -> Dict[str, float]:
+        last = {}
+        for t in range(1, max_steps + 1):
+            last = self.agent.step(self.loss_fn)
+            if self.rcfg.print_every and (t % self.rcfg.print_every == 0 or t in (1, max_steps)):
+                print(f"{t:04d} | L {last['loss']:.6f} | T {last['T']:.3e} | V {last['V']:.3e} "
+                      f"| ρ {last['rho']:.3f} | α {last['alpha']:.4e} | μ {last['mu']:.3f} "
+                      f"| γ {last['gamma']:.3e} | g {last['gnorm']:.3e}")
+            if self.accepted(last):
+                break
+        return last
+
+
+# ---- demo ----
+if __name__ == "__main__":
+    # Quadratic demo: minimize 0.5 θᵀ A θ - bᵀ θ
+    device = "cpu"; dtype = torch.float64
+    A = torch.tensor([[3.0, 0.0],[0.0, 1.0]], dtype=dtype, device=device)
+    b = torch.tensor([1.0,-2.0], dtype=dtype, device=device)
+
+    def quad_loss(theta: Tensor) -> Tensor:
+        return 0.5 * (theta @ (A @ theta)) - (b @ theta)
+
+    ae_cfg = AEConfig(
+        device=device, dtype=dtype,
+        sigma_min=0.0, sigma_max=0.0,  # deterministic
+        auto_gamma=True, auto_gamma_warmup=20,
+        alpha_min=1e-6, alpha_max=0.3,
+    )
+    runner = AERunner(
+        dim=2, loss_fn=quad_loss, ae_cfg=ae_cfg,
+        seed=0, init_alpha=5e-2, init_mu=0.0, init_sigma=0.0,
+        device=device, dtype=dtype,
+        runner_cfg=AERunnerConfig(eps_loss=1e-6, gamma_min=1e-5, v_max_accept=1e-3, print_every=25),
+    )
+
+    print(" step |       L |         T |         V |  rho |     alpha |   mu  |     gamma |   gnorm")
+    print("----- +---------+-----------+-----------+------+-----------+-------+-----------+--------")
+    runner.run(max_steps=300)
+```
+
+---
+
+# `test_ae_machine_runner.py` (quick sanity check)
+
+```python
+# test_ae_machine_runner.py
+from __future__ import annotations
+import torch
+import pytest
+from AE import AEConfig
+from AE_machine_runner import AERunner, AERunnerConfig
+
+@pytest.fixture
+def device(): return "cpu"
+
+def test_aem_runner_quadratic(device):
+    dtype = torch.float64
+    A = torch.tensor([[3.0, 0.0],[0.0, 1.0]], dtype=dtype, device=device)
+    b = torch.tensor([1.0,-2.0], dtype=dtype, device=device)
+    def quad_loss(theta: torch.Tensor) -> torch.Tensor:
+        return 0.5 * (theta @ (A @ theta)) - (b @ theta)
+
+    ae_cfg = AEConfig(device=device, dtype=dtype,
+                      sigma_min=0.0, sigma_max=0.0,
+                      auto_gamma=True, auto_gamma_warmup=20,
+                      alpha_min=1e-6, alpha_max=0.3)
+    runner = AERunner(
+        dim=2, loss_fn=quad_loss, ae_cfg=ae_cfg, seed=0,
+        init_alpha=5e-2, init_mu=0.0,
+        device=device, dtype=dtype,
+        runner_cfg=AERunnerConfig(eps_loss=1e-5, gamma_min=1e-5, v_max_accept=1e-3, print_every=0),
+    )
+    log = runner.run(max_steps=300)
+    assert log["loss"] <= 1e-5 or (log["gamma"] <= 1e-5 and log["V"] <= 1e-3)
+```
+
+---
+
+## Want the memory-augmented variant?
+
+I can add a `DifferentiableTape` (soft pointer + soft read/write) and a tiny “copy-1” toy task powered by AE coefficients. The runner stays the same; we swap in a plant closure that manipulates the tape and computes a supervision loss per step. Say the word and I’ll generate `AE_tape.py` + a demo test.
+
