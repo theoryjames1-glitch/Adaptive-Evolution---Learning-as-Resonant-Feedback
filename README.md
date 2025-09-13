@@ -789,5 +789,281 @@ swarm.run()
 * **`steps_per_round_total` / `min_steps_per_traj`** control exploration vs exploitation.
 * **`dither_sigma`** small (e.g., `1e-4`) if the worst traj keeps stalling.
 
+### AE.py
 
+```python
+# -*- coding: utf-8 -*-
+"""
+AE.py — Adaptive Evolution Optimizer (PyTorch, low-VRAM, numerically safe)
+Evolution = continuous coefficient adaptation (non-biological).
+
+Exports:
+- AEConfig
+- AEAgent
+- AEEnsemble (optional)
+
+Guards & safety:
+- version-safe noise generation (no randn_like(generator=...))
+- gradient sanitization (NaN/Inf -> finite bounds)
+- numeric guards on loss stats (clamp before variance)
+- emergency brake on extreme loss/grad norms
+- NEW: per-step update norm cap (optional) and parameter clamp (abs bound)
+"""
+
+from __future__ import annotations
+from dataclasses import dataclass
+from typing import Callable, Dict, Optional, Tuple, Union, List
+import math
+import torch
+from torch import Tensor
+
+LossFn = Callable[[Tensor], Union[Tensor, Tuple[Tensor, Tensor]]]
+
+# ---------- helpers ----------
+def _clip(x: float, lo: float, hi: float) -> float: return float(max(lo, min(hi, x)))
+def _budget(d: float, mag: Optional[float]) -> float: return float(_clip(d, -mag, mag)) if mag else float(d)
+def _softplus(x: float) -> float:
+    if x > 20: return x
+    if x < -20: return math.exp(x)
+    return math.log1p(math.exp(x))
+
+class _EMA:
+    """Scalar EMA with bias correction (CPU)."""
+    def __init__(self, beta: float):
+        self.b = float(beta); self.m: Optional[float] = None; self.t = 0
+    def update(self, x: float) -> float:
+        x = float(x)
+        if self.m is None: self.m = x; self.t = 1; return x
+        self.m = self.b*self.m + (1.0-self.b)*x; self.t += 1
+        return self.m / max(1.0 - self.b**self.t, 1e-12)
+
+# ---------- config ----------
+@dataclass
+class AEConfig:
+    # Filters
+    beta_mu: float = 0.98; beta_T: float = 0.90; beta_V: float = 0.95; beta_S: float = 0.95; beta_star: float = 0.99
+    # Gains
+    k_p: float = 0.8; k_v: float = 0.8; k_c: float = 0.4
+    gamma_lr: float = 0.05; gamma_mu: float = 0.05
+    # Noise-law gains
+    k_s_stall: float = 0.5; k_s_uncert: float = 0.4; k_s_var: float = 0.4; k_s_quality: float = 0.2
+    # Targets / clamps
+    rho_star: float = 0.30; rho_max: float = 0.95; V_max_mult: float = 4.0
+    gamma_star: float = 1e-2; auto_gamma: bool = True; auto_gamma_warmup: int = 200
+    # Meta-steps
+    eta_a: float = 5e-4; eta_mu: float = 8e-4; eta_sigma: float = 5e-4; eta_gamma: float = 1e-3
+    # Budgets
+    max_dlog_alpha: Optional[float] = 0.10; max_d_mu: Optional[float] = 0.02; max_dlog_sigma: Optional[float] = 0.10
+    # Bounds
+    alpha_min: float = 1e-6; alpha_max: float = 1.0
+    mu_min: float = 0.0; mu_max: float = 0.999
+    sigma_min: float = 0.0; sigma_max: float = 1.0
+    # Anchors
+    alpha_bar: float = 3e-4; mu_bar: float = 0.9
+    # Stall threshold
+    tau_T_stall: float = 0.25
+    # Device/dtype
+    device: Union[str, torch.device] = "cpu"; dtype: torch.dtype = torch.float64
+    # Emergency limits
+    loss_emergency: float = 1e8
+    grad_emergency: float = 1e6
+    # NEW: step & parameter safety
+    step_norm_max: Optional[float] = None     # cap on ||Δθ|| per-step (None disables)
+    param_abs_max: float = 1e6                 # clamp θ ∈ [-param_abs_max, +param_abs_max]
+
+# ---------- AE Agent ----------
+class AEAgent:
+    """
+    Adaptive Evolution optimizer: continuous coefficient adaptation (α, μ, σ).
+    VRAM-neutral: all signals are scalar reductions; no grad clones/flatten.
+    """
+    def __init__(
+        self,
+        dim: int,
+        cfg: AEConfig = AEConfig(),
+        seed: Optional[int] = None,
+        init_theta: Optional[Tensor] = None,
+        init_alpha: float = 3e-4,
+        init_mu: float = 0.9,
+        init_sigma: float = 0.0,
+        device: Optional[Union[str, torch.device]] = None,
+        dtype: Optional[torch.dtype] = None,
+        clip_grad_norm: Optional[float] = None,
+    ):
+        self.cfg = cfg
+        self.device = torch.device(device or cfg.device)
+        self.dtype = dtype or cfg.dtype
+        self.clip_grad_norm = clip_grad_norm
+
+        self.gen = torch.Generator(device=self.device)
+        if seed is not None: self.gen.manual_seed(int(seed))
+
+        if init_theta is None:
+            self.theta = torch.zeros(dim, dtype=self.dtype, device=self.device, requires_grad=True)
+        else:
+            self.theta = init_theta.detach().to(self.device, self.dtype).requires_grad_(True)
+        self.m = torch.zeros_like(self.theta)
+
+        self.alpha = float(init_alpha); self.mu = float(init_mu); self.sigma = float(init_sigma)
+
+        self.mu_l = _EMA(self.cfg.beta_mu); self.T_ema = _EMA(self.cfg.beta_T)
+        self.V_ema = _EMA(self.cfg.beta_V); self.S_ema = _EMA(self.cfg.beta_S)
+        self.Vstar = _EMA(self.cfg.beta_star); self.Sstar = _EMA(self.cfg.beta_star)
+
+        self._step = 0; self._gamma_med = _EMA(0.99); self._gamma_star_auto: Optional[float] = None
+        self._prev_loss: Optional[float] = None
+
+    def step(self, loss_fn: LossFn) -> Dict[str, float]:
+        # forward & gradient
+        out = loss_fn(self.theta)
+        if isinstance(out, (tuple, list)):
+            loss, grad = out
+        else:
+            loss = out
+            grad = torch.autograd.grad(loss, self.theta, retain_graph=False, create_graph=False, allow_unused=False)[0]
+        if grad is None:
+            raise ValueError("loss_fn must depend on theta; grad is None")
+
+        # Sanitize gradient BEFORE any checks: NaN->0, ±Inf->±grad_emergency
+        grad = torch.nan_to_num(grad, 0.0, self.cfg.grad_emergency, -self.cfg.grad_emergency)
+
+        # Optional grad clipping
+        gnorm_t = float(torch.linalg.norm(grad).item())
+        if self.clip_grad_norm is not None and gnorm_t > self.clip_grad_norm and gnorm_t > 0.0:
+            grad = grad * (self.clip_grad_norm / gnorm_t)
+            gnorm_t = float(torch.linalg.norm(grad).item())
+
+        # ---------- Measurement with guards ----------
+        # Loss: allow non-finite here; clamp to emergency scalar below
+        L = float(loss.item()) if torch.isfinite(loss).item() else self.cfg.loss_emergency
+        if abs(L) > self.cfg.loss_emergency:
+            L = math.copysign(self.cfg.loss_emergency, L)
+
+        mu_l = self.mu_l.update(L)
+        dloss = 0.0 if self._prev_loss is None else (L - self._prev_loss)
+        self._prev_loss = L
+        T = self.T_ema.update(dloss)
+
+        # Variance: bound ld before squaring to avoid overflow in V
+        ld = L - mu_l
+        if not math.isfinite(ld): ld = 0.0
+        ld = max(min(ld, 1e6), -1e6)
+        V = self.V_ema.update(ld*ld + 1e-12)
+
+        # Grad stats (scalar reductions only)
+        g = grad; m = self.m
+        sum_g  = float(g.sum().item())
+        sum_g2 = float((g*g).sum().item())
+        n_elem = g.numel()
+        gmean  = sum_g / max(1, n_elem)
+        gvar   = max(sum_g2 / max(1, n_elem) - gmean*gmean, 0.0)
+        S      = self.S_ema.update(gvar + 1e-12)
+        gnorm  = math.sqrt(sum_g2) + 1e-12
+        mnorm  = float(torch.linalg.norm(m).item()) + 1e-12
+        dot_gm = float((g*m).sum().item())
+        rho    = _clip(dot_gm / (gnorm * mnorm), -1.0, 1.0) if mnorm > 1e-12 else 0.0
+
+        # Emergency brake if things are wild
+        if (abs(L) > self.cfg.loss_emergency) or (gnorm > self.cfg.grad_emergency) or (not math.isfinite(gnorm)):
+            self.alpha = max(self.cfg.alpha_min, self.alpha / 10.0)
+            self.mu = min(self.mu, 0.5)
+
+        Vstar = max(self.Vstar.update(V), 1e-12)
+        Sstar = max(self.Sstar.update(S), 1e-12)
+
+        # ---------- Gauge (auto γ*) ----------
+        self._step += 1
+        gamma_est = abs(self.alpha * gnorm)
+        gtrack = self._gamma_med.update(gamma_est)
+        if self.cfg.auto_gamma and self._gamma_star_auto is None and self._step > self.cfg.auto_gamma_warmup:
+            self._gamma_star_auto = 0.8 * max(gtrack, 1e-12)
+        gamma_star = self._gamma_star_auto if self._gamma_star_auto is not None else self.cfg.gamma_star
+
+        # ---------- Drive & evolution ----------
+        # α (log-space)
+        drive_alpha = ( self.cfg.k_p * math.tanh(-T)
+                      - self.cfg.k_v * _softplus(V / Vstar)
+                      + self.cfg.k_c * (rho - self.cfg.rho_star)
+                      - self.cfg.gamma_lr * (math.log(max(self.alpha,1e-12)) - math.log(self.cfg.alpha_bar)) )
+        gauge = self.cfg.eta_gamma * ((gamma_star - self.alpha*gnorm) / (gamma_star + 1e-12))
+        dlog_alpha = _budget(self.cfg.eta_a * drive_alpha + gauge, self.cfg.max_dlog_alpha)
+        self.alpha = _clip(math.exp(math.log(max(self.alpha, self.cfg.alpha_min)) + dlog_alpha),
+                           self.cfg.alpha_min, self.cfg.alpha_max)
+
+        # μ (additive in [0,1])
+        drive_mu = ( 0.8 * math.tanh(rho - self.cfg.rho_star)
+                   - 0.6 * _softplus(V / Vstar)
+                   - self.cfg.gamma_mu * (self.mu - self.cfg.mu_bar) )
+        d_mu = _budget(self.cfg.eta_mu * drive_mu, self.cfg.max_d_mu)
+        self.mu = _clip(self.mu + d_mu, self.cfg.mu_min, self.cfg.mu_max)
+
+        # σ (log-space, usually disabled in tests)
+        stall_thr = self.cfg.tau_T_stall * math.sqrt(Vstar); stall = 1.0 if abs(T) < stall_thr else 0.0
+        A = 0.5 * (rho + 1.0)
+        drive_sigma = ( self.cfg.k_s_stall * stall
+                      + self.cfg.k_s_uncert * (S / Sstar)
+                      - self.cfg.k_s_var   * (V / Vstar)
+                      + self.cfg.k_s_quality * (A - 0.5) )
+        dlog_sigma = _budget(self.cfg.eta_sigma * drive_sigma, self.cfg.max_dlog_sigma)
+        self.sigma = _clip(math.exp(math.log(max(self.sigma, self.cfg.sigma_min + 1e-16)) + dlog_sigma),
+                           self.cfg.sigma_min, self.cfg.sigma_max)
+
+        # Resonance clamp
+        if (V > self.cfg.V_max_mult * Vstar) or (abs(rho) > self.cfg.rho_max):
+            self.alpha = max(self.cfg.alpha_min, self.alpha / 1.25)
+
+        # ---------- parameter update ----------
+        self.m = self.mu * self.m + (1.0 - self.mu) * grad
+        upd = -self.alpha * self.m
+        # optional step cap
+        if self.cfg.step_norm_max is not None:
+            sn = float(torch.linalg.norm(upd).item())
+            if sn > self.cfg.step_norm_max and sn > 0.0:
+                upd = upd * (self.cfg.step_norm_max / sn)
+
+        # Version-safe Gaussian noise
+        if self.sigma > 0.0:
+            n = torch.empty_like(self.theta)
+            try:
+                n.normal_(mean=0.0, std=self.sigma, generator=self.gen)
+            except TypeError:
+                n.normal_(mean=0.0, std=self.sigma)
+            upd = upd + n
+
+        with torch.no_grad():
+            self.theta.add_(upd)
+            # parameter clamp (prevents runaway states)
+            pm = self.cfg.param_abs_max
+            if pm and math.isfinite(pm) and pm > 0:
+                self.theta.clamp_(-pm, pm)
+        self.theta.requires_grad_(True)
+
+        return {"loss": L, "T": T, "V": V, "S": S, "rho": rho,
+                "alpha": self.alpha, "mu": self.mu, "sigma": self.sigma,
+                "gamma": float(self.alpha * gnorm), "gnorm": gnorm}
+
+    update = step
+
+# ---------- Ensemble (coefficients-only consensus) ----------
+class AEEnsemble:
+    def __init__(self, agents: List[AEAgent], beta_weight: float = 2.0, kappa: float = 0.25):
+        assert len(agents) >= 2
+        self.agents = agents; self.beta_weight = float(beta_weight); self.kappa = float(kappa)
+
+    def step(self, loss_fn: LossFn) -> Dict[str, float]:
+        logs = [a.step(loss_fn) for a in self.agents]
+        losses = torch.tensor([lg["loss"] for lg in logs], dtype=torch.float64)
+        w = torch.softmax(-self.beta_weight * (losses - losses.min()), dim=0).cpu().numpy().tolist()
+        bar_alpha = sum(wi * a.alpha for wi, a in zip(w, self.agents))
+        bar_mu    = sum(wi * a.mu    for wi, a in zip(w, self.agents))
+        bar_sigma = sum(wi * a.sigma for wi, a in zip(w, self.agents))
+        for a in self.agents:
+            a.alpha = _clip((1.0 - self.kappa) * a.alpha + self.kappa * bar_alpha, a.cfg.alpha_min, a.cfg.alpha_max)
+            a.mu    = _clip((1.0 - self.kappa) * a.mu    + self.kappa * bar_mu,    a.cfg.mu_min,    a.cfg.mu_max)
+            a.sigma = _clip((1.0 - self.kappa) * a.sigma + self.kappa * bar_sigma, a.cfg.sigma_min, a.cfg.sigma_max)
+        return {"mean_loss": float(losses.mean().item()),
+                "min_loss": float(losses.min().item()),
+                "max_loss": float(losses.max().item()),
+                "bar_alpha": bar_alpha, "bar_mu": bar_mu, "bar_sigma": bar_sigma, "w": w}
+```
 
