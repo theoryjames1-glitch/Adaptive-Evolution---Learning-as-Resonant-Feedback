@@ -1670,3 +1670,241 @@ def test_aem_runner_quadratic(device):
 
 I can add a `DifferentiableTape` (soft pointer + soft read/write) and a tiny “copy-1” toy task powered by AE coefficients. The runner stays the same; we swap in a plant closure that manipulates the tape and computes a supervision loss per step. Say the word and I’ll generate `AE_tape.py` + a demo test.
 
+awesome — here’s a **memory-augmented AE Machine** with a tiny, differentiable tape and a copy-to-read task. It plugs straight into your repo alongside `AE.py` and `AE_machine_runner.py`.
+
+---
+
+# `AE_tape.py` (drop-in)
+
+```python
+# -*- coding: utf-8 -*-
+"""
+AE_tape.py — Differentiable Tape for AE Machine tasks
+- Minimal "soft pointer + soft write/read" tape (Neural Turing Machine–lite)
+- Low-VRAM: no sequences, no unrolled graphs; one differentiable RW per loss call
+- Works with AE_machine_runner.AERunner (loss_fn closes over a TapeEnv)
+
+Usage:
+    from AE_tape import DifferentiableTape, TapeEnv, make_copy_task
+
+    tape = DifferentiableTape(n_cells=8, cell_dim=4, device="cpu", dtype=torch.float64)
+    env  = TapeEnv(tape)
+    target = torch.tensor([1.,0.,0.,-1.], dtype=torch.float64)
+    loss_fn = make_copy_task(env, target, reset_each_call=True)
+    # feed loss_fn to AERunner; θ encodes write vector + write/read logits
+"""
+
+from __future__ import annotations
+from dataclasses import dataclass
+from typing import Optional, Callable, Tuple
+import torch
+from torch import Tensor
+import torch.nn.functional as F
+
+# ---------------- Differentiable Tape ----------------
+
+class DifferentiableTape:
+    """
+    Memory tape with N cells of dimension D.
+    Read/Write via soft attention a ∈ Δ^{N-1} (softmax over positions).
+    """
+    def __init__(self, n_cells: int, cell_dim: int,
+                 device: str | torch.device = "cpu",
+                 dtype: torch.dtype = torch.float64):
+        assert n_cells >= 1 and cell_dim >= 1
+        self.n = int(n_cells)
+        self.d = int(cell_dim)
+        self.device = torch.device(device)
+        self.dtype = dtype
+        self.M = torch.zeros(self.n, self.d, device=self.device, dtype=self.dtype)
+
+    def reset_(self, value: Optional[Tensor] = None):
+        if value is None:
+            self.M.zero_()
+        else:
+            val = value.to(self.device, self.dtype)
+            assert val.shape == self.M.shape
+            self.M.copy_(val)
+
+    def attend(self, logits: Tensor) -> Tensor:
+        """Soft attention over positions. logits shape: [N]"""
+        logits = logits.to(self.device, self.dtype)
+        return F.softmax(logits, dim=-1)
+
+    def read(self, attn: Tensor) -> Tensor:
+        """r = a^T M; attn shape [N], returns [D]"""
+        attn = attn.to(self.device, self.dtype)
+        return torch.mv(self.M.t(), attn)
+
+    def write(self, attn: Tensor, delta: Tensor):
+        """M <- M + a ⊗ delta (additive write)"""
+        attn = attn.to(self.device, self.dtype)
+        delta = delta.to(self.device, self.dtype)
+        self.M.add_(torch.ger(attn, delta))  # outer product
+
+# ---------------- Environment wrapper ----------------
+
+@dataclass
+class TapeEnv:
+    tape: DifferentiableTape
+    entropy_reg: float = 1e-3    # encourage sharp but stable attention
+    write_scale_reg: float = 1e-6
+
+    def reset(self):
+        self.tape.reset_()
+
+# ---------------- Task factory ----------------
+
+def make_copy_task(env: TapeEnv, target: Tensor, reset_each_call: bool = True
+                   ) -> Callable[[Tensor], Tensor]:
+    """
+    Returns loss_fn(θ):
+      θ packs [ write_vec (D) | write_logits (N) | read_logits (N) ]
+    Steps:
+      1) (optional) reset tape to zeros (deterministic across optimizer steps)
+      2) a_w = softmax(write_logits); write write_vec to tape at a_w
+      3) a_r = softmax(read_logits); read r = a_r^T M
+      4) loss = 0.5 || r - target ||^2 + small entropy regularizers
+    """
+    target = target.detach().to(env.tape.device, env.tape.dtype)
+
+    D = env.tape.d
+    N = env.tape.n
+    def loss_fn(theta: Tensor) -> Tensor:
+        assert theta.numel() == D + 2*N, \
+            f"θ must have {D+2*N} elements (got {theta.numel()})"
+        write_vec   = theta[:D]
+        write_logit = theta[D:D+N]
+        read_logit  = theta[D+N:D+2*N]
+
+        if reset_each_call:
+            env.reset()
+
+        a_w = env.tape.attend(write_logit)
+        env.tape.write(a_w, write_vec)
+
+        a_r = env.tape.attend(read_logit)
+        r = env.tape.read(a_r)
+
+        mse = 0.5 * torch.sum((r - target)**2)
+        # entropy regularization (maximize entropy modestly for stability)
+        # H(a) = -sum a log a; we *subtract* H (i.e., add -H) with small weight to prefer peaky but not pathological
+        eps = 1e-12
+        H_w = -torch.sum(a_w * torch.log(a_w + eps))
+        H_r = -torch.sum(a_r * torch.log(a_r + eps))
+        ent_loss = env.entropy_reg * ( -H_w - H_r )
+        reg = env.write_scale_reg * torch.sum(write_vec**2)
+        return mse + ent_loss + reg
+
+    return loss_fn
+
+# ---------------- Demo ----------------
+
+if __name__ == "__main__":
+    # Tiny demo: AE will learn to (a) place write/read at same cell, (b) write target vector
+    from AE import AEConfig
+    from AE_machine_runner import AERunner, AERunnerConfig
+
+    device, dtype = "cpu", torch.float64
+    tape = DifferentiableTape(n_cells=8, cell_dim=4, device=device, dtype=dtype)
+    env  = TapeEnv(tape)
+    target = torch.tensor([0.5, -1.0, 0.0, 0.25], dtype=dtype, device=device)
+
+    loss_fn = make_copy_task(env, target, reset_each_call=True)
+
+    # θ packs [D + 2N]
+    dim_theta = tape.d + 2*tape.n
+
+    ae_cfg = AEConfig(
+        device=device, dtype=dtype,
+        sigma_min=0.0, sigma_max=0.0,
+        auto_gamma=True, auto_gamma_warmup=25,
+        alpha_min=1e-6, alpha_max=0.2,
+    )
+    runner = AERunner(
+        dim=dim_theta, loss_fn=loss_fn, ae_cfg=ae_cfg,
+        seed=0, init_alpha=5e-2, init_mu=0.0,
+        device=device, dtype=dtype,
+        runner_cfg=AERunnerConfig(eps_loss=2e-3, gamma_min=5e-5, v_max_accept=5e-3, print_every=50),
+    )
+
+    print(" step |       L |         T |         V |  rho |     alpha |   mu  |     gamma |   gnorm")
+    print("----- +---------+-----------+-----------+------+-----------+-------+-----------+--------")
+    final = runner.run(max_steps=500)
+    print("final:", final)
+```
+
+---
+
+# `test_ae_tape.py` (quick, deterministic tests)
+
+```python
+# test_ae_tape.py
+from __future__ import annotations
+import torch
+import pytest
+from AE import AEConfig
+from AE_machine_runner import AERunner, AERunnerConfig
+from AE_tape import DifferentiableTape, TapeEnv, make_copy_task
+
+@pytest.fixture(autouse=True)
+def _seed_all():
+    torch.manual_seed(1234)
+
+@pytest.fixture
+def device(): return "cpu"
+
+def test_tape_read_write_roundtrip(device):
+    tape = DifferentiableTape(n_cells=5, cell_dim=3, device=device, dtype=torch.float64)
+    tape.reset_()
+    # write at cell 2 (softmax over logits)
+    logits = torch.tensor([-5.0, -5.0, 5.0, -5.0, -5.0], dtype=torch.float64, device=device)
+    a = tape.attend(logits)
+    v = torch.tensor([1.0, -2.0, 0.5], dtype=torch.float64, device=device)
+    tape.write(a, v)
+    r = tape.read(a)
+    assert torch.allclose(r, v, atol=1e-10)
+
+def test_ae_machine_copy_task_converges(device):
+    dtype = torch.float64
+    tape = DifferentiableTape(n_cells=8, cell_dim=4, device=device, dtype=dtype)
+    env  = TapeEnv(tape, entropy_reg=5e-4, write_scale_reg=1e-6)
+    target = torch.tensor([0.5, -1.0, 0.0, 0.25], dtype=dtype, device=device)
+    loss_fn = make_copy_task(env, target, reset_each_call=True)
+    dim_theta = tape.d + 2*tape.n
+
+    cfg = AEConfig(
+        device=device, dtype=dtype,
+        sigma_min=0.0, sigma_max=0.0,         # deterministic
+        auto_gamma=True, auto_gamma_warmup=20,
+        alpha_min=1e-6, alpha_max=0.2,
+    )
+    runner = AERunner(
+        dim=dim_theta, loss_fn=loss_fn, ae_cfg=cfg, seed=7,
+        init_alpha=0.05, init_mu=0.0,
+        device=device, dtype=dtype,
+        runner_cfg=AERunnerConfig(eps_loss=2e-3, gamma_min=5e-5, v_max_accept=5e-3, print_every=0),
+    )
+
+    # evaluate initial loss
+    theta0 = runner.agent.theta.detach().clone().requires_grad_(True)
+    loss0 = float(loss_fn(theta0).item())
+
+    log = runner.run(max_steps=400)
+    thetaT = runner.agent.theta.detach().clone().requires_grad_(True)
+    lossT = float(loss_fn(thetaT).item())
+
+    # Expect strong reduction; keep tolerant for different BLAS/OS
+    assert lossT <= 0.4 * loss0 + 1e-9
+```
+
+---
+
+## Notes
+
+* **Low VRAM:** The tape op does a single RW per loss call; no sequence unrolling, no extra buffers. All AE signals are scalar reductions.
+* **Determinism:** We set `sigma=0` and fix seeds; the tape is reset each call. This makes the unit test stable and fast.
+* **Extendability:** You can create richer tasks by composing multiple RW ops inside `make_*_task` closures (palindrome check, reverse, k-shift), still with a single differentiable pass.
+
+If you want a **Neural Turing Machine–style shiftable pointer** (circular convolution + sharpening), I can add a `SoftPointer` class and a `make_shift_task` that trains AE to learn a fixed shift and recall.
+
