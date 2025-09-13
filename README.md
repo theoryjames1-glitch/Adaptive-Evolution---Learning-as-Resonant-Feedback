@@ -1155,4 +1155,343 @@ This gives you a physics-style, continuous “machine” that optimizes rather t
 * **AE**: continuous, feedback-driven **optimization**; convergence/resonance; sample/stability metrics; noise is a feature.
 * They can simulate each other in idealized limits, but they serve different purposes. For building resilient, self-tuning learning systems in changing environments, **AE is the right hammer**; for exact algorithms and formal proofs, **TM is**.
 
+heck yes. here’s a clean, formal spec of an **AE Machine** plus a compact, drop-in PyTorch implementation you can run today.
+
+# AE Machine — formal core
+
+Define an AE Machine as the tuple
+
+$$
+\mathcal{M}=(\mathcal{X},\mathcal{C},\mathcal{M}em,\;F,\;G,\;S,\;H,\;E),
+$$
+
+with:
+
+* **State** $\mathcal{X}$: plant/policy state $(\theta_t, m_t, x_t)\in\mathbb{R}^{d_\theta}\times\mathbb{R}^{d_\theta}\times\mathbb{R}^{d_x}$
+* **Coefficients** $\mathcal{C}$: adaptation knobs $c_t=(\alpha_t,\mu_t,\sigma_t,\dots)$
+* **Memory** $\mathcal{M}em$: optional differentiable buffer $b_t\in\mathbb{R}^{d_b}$ with read/write $R,W$
+* **Plant transition** $F$: executes the task and returns a loss (and optional reward)
+
+  * $x_{t+1},\,\ell_t = F(x_t,\theta_t,b_t;z_t)$
+* **Selection/Adaptation** $G$: closed-loop coefficient law
+
+  * $c_{t+1} = G(c_t,\;S(\ell_t,\Delta\ell_t,v_t,r_t,\dots))$
+* **Signals** $S$: filtered statistics (trend $\Delta\ell$, variance $v$, reward $r$, etc.)
+* **Halt/Accept** $H$: resonance/goal predicate (e.g., $\ell_t\le\varepsilon$ or $\gamma_t\!\le\!\gamma_{\min}$ with bounded variance)
+* **Environment** $E$: supplies data $z_t$ (supervised batch, RL rollout, etc.)
+
+Parameter/coeff updates (illustrative):
+
+* Momentum: $m_{t+1}=\mu_t m_t+(1-\mu_t)\nabla_\theta \ell_t$
+* Params: $\theta_{t+1}=\theta_t-\alpha_t m_{t+1}+\sigma_t \xi_t$
+* Coeffs (log/σ-logs for positivity, logistic for $\mu$):
+  $\log \alpha_{t+1}=\log\alpha_t+\eta_\alpha\,k_\alpha^\top \phi(S_t)$
+  $\mu_{t+1}=\mathrm{sigmoid}(k_\mu^\top\phi(S_t))$
+  $\log \sigma_{t+1}=\log\sigma_t+\eta_\sigma\,k_\sigma^\top \phi(S_t)$
+
+Acceptance (example):
+$H$ true if $\ell_t\le\varepsilon$ **or** $\gamma_t= \alpha_t\|\nabla\ell_t\|\le\gamma_{\min}$ with $v_t$ below a stability threshold.
+
+---
+
+# AE Machine — reference implementation (single file)
+
+Save as `AE_Machine.py`:
+
+```python
+# -*- coding: utf-8 -*-
+"""
+AE_Machine.py — Minimal Adaptive Evolution Machine (PyTorch)
+- Closed-loop coefficient adaptation (α, μ, σ) that steers optimizer behavior
+- Differentiable laws, DSP-style signals, resonance-based halting
+- Low-VRAM: scalar statistics only; no gradient clones/flatten
+
+Run this file to see a 2D quadratic demo.
+"""
+
+from __future__ import annotations
+from dataclasses import dataclass
+from typing import Callable, Dict, Optional, Tuple, Union
+import math, torch
+from torch import Tensor
+
+LossFn = Callable[[Tensor], Union[Tensor, Tuple[Tensor, Tensor]]]
+PlantFn = Callable[[Tensor], Tensor]  # maps θ -> loss (optionally depends on external x, b via closure)
+
+# ---------- tiny utils ----------
+def _clip(x: float, lo: float, hi: float) -> float: return float(max(lo, min(hi, x)))
+def _budget(d: float, mag: Optional[float]) -> float: return float(_clip(d, -mag, mag)) if mag else float(d)
+def _softplus(x: float) -> float:
+    if x > 20: return x
+    if x < -20: return math.exp(x)
+    return math.log1p(math.exp(x))
+
+class _EMA:
+    """Scalar EMA with bias correction."""
+    def __init__(self, beta: float):
+        self.b = float(beta); self.m: Optional[float] = None; self.t = 0
+    def update(self, x: float) -> float:
+        x = float(x)
+        if self.m is None: self.m = x; self.t = 1; return x
+        self.m = self.b*self.m + (1.0-self.b)*x; self.t += 1
+        return self.m / max(1.0 - self.b**self.t, 1e-12)
+
+# ---------- machine config ----------
+@dataclass
+class AEMConfig:
+    # Filters for signals
+    beta_mu: float = 0.98; beta_T: float = 0.90; beta_V: float = 0.95; beta_S: float = 0.95; beta_star: float = 0.99
+    # Coefficient gains (policy over signals)
+    k_p: float = 0.8; k_v: float = 0.8; k_c: float = 0.4
+    gamma_lr: float = 0.05; gamma_mu: float = 0.05
+    # Noise-law gains
+    k_s_stall: float = 0.5; k_s_uncert: float = 0.4; k_s_var: float = 0.4; k_s_quality: float = 0.2
+    # Targets / clamps
+    rho_star: float = 0.30; rho_max: float = 0.95; V_max_mult: float = 4.0
+    gamma_star: float = 1e-2; auto_gamma: bool = True; auto_gamma_warmup: int = 200
+    # Meta-steps
+    eta_a: float = 5e-4; eta_mu: float = 8e-4; eta_sigma: float = 5e-4; eta_gamma: float = 1e-3
+    # Per-step budgets
+    max_dlog_alpha: Optional[float] = 0.10; max_d_mu: Optional[float] = 0.02; max_dlog_sigma: Optional[float] = 0.10
+    # Coefficient bounds
+    alpha_min: float = 1e-6; alpha_max: float = 1.0
+    mu_min: float = 0.0; mu_max: float = 0.999
+    sigma_min: float = 0.0; sigma_max: float = 1.0
+    # Anchors
+    alpha_bar: float = 3e-4; mu_bar: float = 0.9
+    # Stall threshold (for σ)
+    tau_T_stall: float = 0.25
+    # Halt/accept thresholds
+    eps_loss: float = 1e-3; gamma_min: float = 1e-4; v_max_accept: float = 1e-2
+    # Device/dtype
+    device: Union[str, torch.device] = "cpu"; dtype: torch.dtype = torch.float64
+    # Numeric safety
+    loss_emergency: float = 1e8; grad_emergency: float = 1e6
+    step_norm_max: Optional[float] = None
+    param_abs_max: float = 1e6
+
+# ---------- AE Machine ----------
+class AEMachine:
+    """
+    AE Machine:
+      - Parameters θ (learned), momentum m
+      - Coefficients (α, μ, σ) adapt from filtered signals (T, V, S, ρ)
+      - Plant provides loss given θ (via closure or callable)
+      - Optional memory/externals can live in the plant closure
+    """
+    def __init__(
+        self,
+        dim_theta: int,
+        plant_loss: PlantFn,
+        cfg: AEMConfig = AEMConfig(),
+        seed: Optional[int] = None,
+        init_theta: Optional[Tensor] = None,
+        init_alpha: float = 3e-4,
+        init_mu: float = 0.9,
+        init_sigma: float = 0.0,
+        device: Optional[Union[str, torch.device]] = None,
+        dtype: Optional[torch.dtype] = None,
+        clip_grad_norm: Optional[float] = None,
+    ):
+        self.cfg = cfg
+        self.device = torch.device(device or cfg.device)
+        self.dtype = dtype or cfg.dtype
+        self.plant_loss = plant_loss
+        self.clip_grad_norm = clip_grad_norm
+
+        # RNG
+        self.gen = torch.Generator(device=self.device)
+        if seed is not None: self.gen.manual_seed(int(seed))
+
+        # Parameters & momentum
+        if init_theta is None:
+            self.theta = torch.zeros(dim_theta, dtype=self.dtype, device=self.device, requires_grad=True)
+        else:
+            self.theta = init_theta.detach().to(self.device, self.dtype).requires_grad_(True)
+        self.m = torch.zeros_like(self.theta)
+
+        # Coefficients
+        self.alpha = float(init_alpha); self.mu = float(init_mu); self.sigma = float(init_sigma)
+
+        # EMAs
+        self.mu_l = _EMA(self.cfg.beta_mu); self.T_ema = _EMA(self.cfg.beta_T)
+        self.V_ema = _EMA(self.cfg.beta_V); self.S_ema = _EMA(self.cfg.beta_S)
+        self.Vstar = _EMA(self.cfg.beta_star); self.Sstar = _EMA(self.cfg.beta_star)
+
+        # Auto-gamma calibration
+        self._step = 0; self._gamma_med = _EMA(0.99); self._gamma_star_auto: Optional[float] = None
+        self._prev_loss: Optional[float] = None
+
+    # ---- one machine step ----
+    def step(self) -> Dict[str, float]:
+        out = self.plant_loss(self.theta)
+        if isinstance(out, (tuple, list)):
+            loss, grad = out
+        else:
+            loss = out
+            grad = torch.autograd.grad(loss, self.theta, retain_graph=False, create_graph=False, allow_unused=False)[0]
+        if grad is None: raise ValueError("plant_loss must depend on theta; grad is None")
+
+        # sanitize grad, clip (numeric safety)
+        grad = torch.nan_to_num(grad, 0.0, self.cfg.grad_emergency, -self.cfg.grad_emergency)
+        gnorm_t = float(torch.linalg.norm(grad).item())
+        if self.clip_grad_norm is not None and gnorm_t > self.clip_grad_norm and gnorm_t > 0.0:
+            grad = grad * (self.clip_grad_norm / gnorm_t)
+            gnorm_t = float(torch.linalg.norm(grad).item())
+
+        # loss clamp for stats
+        L = float(loss.item()) if torch.isfinite(loss).item() else self.cfg.loss_emergency
+        if abs(L) > self.cfg.loss_emergency: L = math.copysign(self.cfg.loss_emergency, L)
+
+        # signals (trend/variance/grad variance)
+        mu_l = self.mu_l.update(L)
+        dloss = 0.0 if self._prev_loss is None else (L - self._prev_loss)
+        self._prev_loss = L
+        T = self.T_ema.update(dloss)
+        ld = L - mu_l
+        if not math.isfinite(ld): ld = 0.0
+        ld = max(min(ld, 1e6), -1e6)
+        V = self.V_ema.update(ld*ld + 1e-12)
+
+        g = grad; m = self.m
+        sum_g  = float(g.sum().item()); sum_g2 = float((g*g).sum().item())
+        n = g.numel(); gmean = sum_g / max(1, n)
+        gvar = max(sum_g2 / max(1, n) - gmean*gmean, 0.0)
+        S = self.S_ema.update(gvar + 1e-12)
+        gnorm = math.sqrt(sum_g2) + 1e-12
+        mnorm = float(torch.linalg.norm(m).item()) + 1e-12
+        dotgm = float((g*m).sum().item())
+        rho = _clip(dotgm / (gnorm*mnorm), -1.0, 1.0) if mnorm > 1e-12 else 0.0
+
+        if (abs(L) > self.cfg.loss_emergency) or (gnorm > self.cfg.grad_emergency) or (not math.isfinite(gnorm)):
+            self.alpha = max(self.cfg.alpha_min, self.alpha / 10.0); self.mu = min(self.mu, 0.5)
+
+        Vstar = max(self.Vstar.update(V), 1e-12); Sstar = max(self.Sstar.update(S), 1e-12)
+
+        # auto-gamma target
+        self._step += 1
+        gamma_est = abs(self.alpha * gnorm); gtrack = self._gamma_med.update(gamma_est)
+        if self.cfg.auto_gamma and self._gamma_star_auto is None and self._step > self.cfg.auto_gamma_warmup:
+            self._gamma_star_auto = 0.8 * max(gtrack, 1e-12)
+        gamma_star = self._gamma_star_auto if self._gamma_star_auto is not None else self.cfg.gamma_star
+
+        # ----- coefficient evolution -----
+        # α (log-space with gauge)
+        drive_alpha = ( self.cfg.k_p * math.tanh(-T)
+                      - self.cfg.k_v * _softplus(V / Vstar)
+                      + self.cfg.k_c * (rho - self.cfg.rho_star)
+                      - self.cfg.gamma_lr * (math.log(max(self.alpha,1e-12)) - math.log(self.cfg.alpha_bar)) )
+        gauge = self.cfg.eta_gamma * ((gamma_star - self.alpha*gnorm) / (gamma_star + 1e-12))
+        dlog_a = _budget(self.cfg.eta_a * drive_alpha + gauge, self.cfg.max_dlog_alpha)
+        self.alpha = _clip(math.exp(math.log(max(self.alpha, self.cfg.alpha_min)) + dlog_a),
+                           self.cfg.alpha_min, self.cfg.alpha_max)
+        # μ (bounded additive)
+        drive_mu = ( 0.8 * math.tanh(rho - self.cfg.rho_star)
+                   - 0.6 * _softplus(V / Vstar)
+                   - self.cfg.gamma_mu * (self.mu - self.cfg.mu_bar) )
+        d_mu = _budget(self.cfg.eta_mu * drive_mu, self.cfg.max_d_mu)
+        self.mu = _clip(self.mu + d_mu, self.cfg.mu_min, self.cfg.mu_max)
+        # σ (log-space)
+        stall_thr = self.cfg.tau_T_stall * math.sqrt(Vstar); stall = 1.0 if abs(T) < stall_thr else 0.0
+        A = 0.5 * (rho + 1.0)
+        drive_sigma = ( self.cfg.k_s_stall * stall
+                      + self.cfg.k_s_uncert * (S / Sstar)
+                      - self.cfg.k_s_var   * (V / Vstar)
+                      + self.cfg.k_s_quality * (A - 0.5) )
+        dlog_s = _budget(self.cfg.eta_sigma * drive_sigma, self.cfg.max_dlog_sigma)
+        self.sigma = _clip(math.exp(math.log(max(self.sigma, self.cfg.sigma_min + 1e-16)) + dlog_s),
+                           self.cfg.sigma_min, self.cfg.sigma_max)
+
+        # resonance clamp
+        if (V > self.cfg.V_max_mult * Vstar) or (abs(rho) > self.cfg.rho_max):
+            self.alpha = max(self.cfg.alpha_min, self.alpha / 1.25)
+
+        # ----- parameter update -----
+        self.m = self.mu * self.m + (1.0 - self.mu) * grad
+        upd = -self.alpha * self.m
+        if self.cfg.step_norm_max is not None:
+            sn = float(torch.linalg.norm(upd).item())
+            if sn > self.cfg.step_norm_max and sn > 0.0:
+                upd = upd * (self.cfg.step_norm_max / sn)
+        if self.sigma > 0.0:
+            n = torch.empty_like(self.theta)
+            try:
+                n.normal_(mean=0.0, std=self.sigma, generator=self.gen)
+            except TypeError:
+                n.normal_(mean=0.0, std=self.sigma)
+            upd = upd + n
+        with torch.no_grad():
+            self.theta.add_(upd)
+            pm = self.cfg.param_abs_max
+            if pm and math.isfinite(pm) and pm > 0:
+                self.theta.clamp_(-pm, pm)
+        self.theta.requires_grad_(True)
+
+        return {"loss": L, "T": T, "V": V, "S": S, "rho": rho,
+                "alpha": self.alpha, "mu": self.mu, "sigma": self.sigma,
+                "gamma": float(self.alpha * gnorm), "gnorm": gnorm}
+
+    # ---- acceptance ----
+    def accepted(self, log: Dict[str, float]) -> bool:
+        return (log["loss"] <= self.cfg.eps_loss) or \
+               ((log["gamma"] <= self.cfg.gamma_min) and (log["V"] <= self.cfg.v_max_accept))
+
+    # ---- run loop ----
+    def run(self, max_steps: int, print_every: int = 0) -> Dict[str, float]:
+        last = {}
+        for t in range(1, max_steps+1):
+            last = self.step()
+            if print_every and (t % print_every == 0 or t in (1, max_steps)):
+                print(f"{t:04d} | L {last['loss']:.6f} | T {last['T']:.3e} | V {last['V']:.3e} "
+                      f"| ρ {last['rho']:.3f} | α {last['alpha']:.4e} | μ {last['mu']:.3f} "
+                      f"| γ {last['gamma']:.3e} | g {last['gnorm']:.3e}")
+            if self.accepted(last):
+                break
+        return last
+
+
+# ---------- demo ----------
+if __name__ == "__main__":
+    # Quadratic plant: minimize 0.5 θᵀ A θ - bᵀ θ
+    device = "cpu"; dtype = torch.float64
+    A = torch.tensor([[3.0, 0.0],[0.0, 1.0]], dtype=dtype, device=device)
+    b = torch.tensor([1.0,-2.0], dtype=dtype, device=device)
+
+    def quad_loss(theta: Tensor) -> Tensor:
+        return 0.5 * (theta @ (A @ theta)) - (b @ theta)
+
+    cfg = AEMConfig(
+        device=device, dtype=dtype,
+        sigma_min=0.0, sigma_max=0.0,  # deterministic demo
+        auto_gamma=True, auto_gamma_warmup=20,
+        alpha_min=1e-6, alpha_max=0.3,
+        step_norm_max=None, param_abs_max=1e6,
+        eps_loss=1e-6, gamma_min=1e-5, v_max_accept=1e-3
+    )
+    mach = AEMachine(dim_theta=2, plant_loss=quad_loss, cfg=cfg,
+                     seed=0, init_alpha=5e-2, init_mu=0.0, init_sigma=0.0,
+                     device=device, dtype=dtype, clip_grad_norm=None)
+
+    print(" step |       L |         T |         V |  rho |     alpha |   mu  |     gamma |   gnorm")
+    print("----- +---------+-----------+-----------+------+-----------+-------+-----------+--------")
+    mach.run(max_steps=300, print_every=25)
+```
+
+---
+
+## How this matches the spec
+
+* **F (plant)**: `plant_loss(θ)` is your task/environment hook (supervised batch, policy rollout, etc.).
+* **G (adaptation)**: `step()` updates $(\alpha,\mu,\sigma)$ from filtered signals $T,V,S,\rho$.
+* **S (signals)**: trend $T$, loss variance $V$, grad variance $S$, gradient–momentum alignment $\rho$.
+* **H (accept)**: `accepted(...)` enforces an optimization/“resonance” halt.
+* **Safety**: gradient sanitization, optional step-norm cap, parameter clamp; all scalar stats → **no VRAM bloat** vs vanilla.
+
+## Plug-in ideas
+
+* **RL:** make `plant_loss` return policy loss from your rollout buffer; keep σ at 0 or adapt it as exploration noise.
+* **Meta-learning:** learn `k_*` and `η_*` by differentiating through `AEMachine.run` (laws are smooth).
+* **Memory:** close over an external state (buffer `b_t`) inside `plant_loss`; update it in place each call if needed.
+
+If you want, I can wire this AE Machine to your existing `AE.py` agent (as a drop-in “controller core”) or sketch a memory-augmented variant with a tiny differentiable tape.
 
